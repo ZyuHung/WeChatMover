@@ -16,17 +16,29 @@ enum CodeSigner {
     }
 
     /// 进程内直接执行的 codesign 参数。
-    static var codesignArguments: [String] {
-        ["--sign", "-", "--force", "--deep", wechatAppPath]
+    static var codesignArguments: [String] { codesignArguments(appPath: wechatAppPath) }
+
+    static func codesignArguments(appPath: String) -> [String] {
+        ["--sign", "-", "--force", "--deep", appPath]
     }
 
     /// 兜底方案：包当前用户不可写时在终端里执行的命令（终端通常已有「App 管理」权限）。
-    static var shellCommand: String {
-        "codesign --sign - --force --deep \(wechatAppPath)"
+    static var shellCommand: String { shellCommand(appPath: wechatAppPath) }
+
+    static func shellCommand(appPath: String) -> String {
+        "codesign --sign - --force --deep \(shellQuoted(appPath))"
     }
 
-    static var terminalCommand: String {
-        "sudo \(shellCommand)"
+    static var terminalCommand: String { terminalCommand(appPath: wechatAppPath) }
+
+    static func terminalCommand(appPath: String) -> String {
+        "sudo \(shellCommand(appPath: appPath))"
+    }
+
+    /// 路径含空格等特殊字符时加单引号（普通路径原样返回，保持命令简洁）。
+    static func shellQuoted(_ path: String) -> String {
+        let plain = path.allSatisfy { $0.isLetter || $0.isNumber || "/._-+".contains($0) }
+        return plain ? path : "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     /// /Applications/WeChat.app 当前用户是否可写（不可写时需终端 sudo 兜底）。
@@ -87,10 +99,13 @@ enum CodeSigner {
 
     /// 对微信执行 ad-hoc 重签名（异步，completion 在后台线程回调）。
     /// 不提权、不弹密码框；首次可能触发 TCC「App 管理」授权提示。
-    static func resignWeChat(completion: @escaping @Sendable (ResignResult) -> Void) {
+    static func resignWeChat(
+        appPath: String = wechatAppPath,
+        completion: @escaping @Sendable (ResignResult) -> Void
+    ) {
         run(
             executableURL: URL(fileURLWithPath: "/usr/bin/codesign"),
-            arguments: codesignArguments,
+            arguments: codesignArguments(appPath: appPath),
             completion: completion
         )
     }

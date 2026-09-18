@@ -69,21 +69,22 @@ enum Fingerprint {
 
     // MARK: - 迁移清单（manifest.json）
 
-    /// 清单文件位置：<目标文件夹>/WeChatData/manifest.json
-    static func manifestURL(base: URL) -> URL {
-        WeChatPaths.targetRoot(forBase: base).appendingPathComponent("manifest.json")
+    /// 清单文件位置：<目标文件夹>/WeChatData/manifest.json（双开为 WeChatData2 等）
+    static func manifestURL(base: URL, folder: String = WeChatPaths.defaultDataFolder) -> URL {
+        WeChatPaths.targetRoot(forBase: base, folder: folder).appendingPathComponent("manifest.json")
     }
 
-    static func writeManifest(_ manifest: MigrationManifest, base: URL) throws {
+    static func writeManifest(_ manifest: MigrationManifest, base: URL,
+                              folder: String = WeChatPaths.defaultDataFolder) throws {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(manifest)
-        try data.write(to: manifestURL(base: base), options: .atomic)
+        try data.write(to: manifestURL(base: base, folder: folder), options: .atomic)
     }
 
-    static func readManifest(base: URL) -> MigrationManifest? {
-        guard let data = try? Data(contentsOf: manifestURL(base: base)) else { return nil }
+    static func readManifest(base: URL, folder: String = WeChatPaths.defaultDataFolder) -> MigrationManifest? {
+        guard let data = try? Data(contentsOf: manifestURL(base: base, folder: folder)) else { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try? decoder.decode(MigrationManifest.self, from: data)

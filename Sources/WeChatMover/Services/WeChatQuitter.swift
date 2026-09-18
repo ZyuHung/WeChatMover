@@ -3,15 +3,14 @@ import AppKit
 
 /// 退出微信：优先优雅退出（AppleScript quit），等几秒仍未退出再强制结束。
 /// 强杀的是自己用户的进程，不需要管理员权限。
+/// 按 bundle ID 定位：双开时两个 App 同名 WeChat，按名字会退错实例。
 enum WeChatQuitter {
-    static let appName = "WeChat"
-
-    /// 优雅退出：AppleScript `tell application "WeChat" to quit`。
+    /// 优雅退出：AppleScript `tell application id "<bundleID>" to quit`。
     /// 可能触发「自动化」权限弹窗，调用方负责在此之前激活本 App。
-    static func requestGracefulQuit() {
+    static func requestGracefulQuit(bundleID: String = WeChatDetector.bundleID) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", "tell application \"\(appName)\" to quit"]
+        process.arguments = ["-e", "tell application id \"\(bundleID)\" to quit"]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try? process.run()
@@ -19,9 +18,9 @@ enum WeChatQuitter {
     }
 
     /// 强制结束当前用户的全部微信进程（kill，无需提权）。
-    static func forceKill() {
+    static func forceKill(bundleID: String = WeChatDetector.bundleID) {
         for app in NSRunningApplication.runningApplications(
-            withBundleIdentifier: WeChatDetector.bundleID
+            withBundleIdentifier: bundleID
         ) {
             app.forceTerminate()
         }
@@ -41,14 +40,22 @@ enum WeChatQuitter {
         return !isRunning()
     }
 
+    /// 退出指定实例（只影响该 bundle ID 的进程，另一个微信照常运行）。
+    static func ensureQuit(bundleID: String) async -> Bool {
+        await ensureQuit(
+            isRunning: { WeChatDetector.isRunning(bundleID: bundleID) },
+            graceful: { requestGracefulQuit(bundleID: bundleID) },
+            force: { forceKill(bundleID: bundleID) })
+    }
+
     /// 完整流程：优雅退出 → 等 graceTimeout → 仍运行则强杀 → 再等 forceTimeout。
     /// 依赖全部可注入，单测用假 closure 验证流程分支，不触碰真实微信。
     static func ensureQuit(
         graceTimeout: TimeInterval = 5,
         forceTimeout: TimeInterval = 3,
         isRunning: () -> Bool = WeChatDetector.isRunning,
-        graceful: () -> Void = requestGracefulQuit,
-        force: () -> Void = forceKill
+        graceful: () -> Void = { requestGracefulQuit() },
+        force: () -> Void = { forceKill() }
     ) async -> Bool {
         guard isRunning() else { return true }
         graceful()

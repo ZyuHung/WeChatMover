@@ -21,11 +21,13 @@ enum BusyKind: Equatable {
     case cleaningExternal
     case quittingWeChat
     case resigning
+    case repairingDualInstance   // 修复双开：改回 bundle ID（随后进入重签名）
 }
 
 /// 首要阻塞原因（主按钮禁用时在横幅里解释的就是它）。
 enum Blocker: Equatable {
     case notInstalled
+    case dualInstanceReverted(name: String)   // 双开副本被微信升级还原成主微信身份
     case appStoreVersion
     case containerUnreadable
     case interruptedResidue
@@ -66,6 +68,7 @@ enum FixAction: Equatable {
     case openFullDiskAccess
     case openOfficialDownload
     case retryMigration
+    case repairDualInstance
 }
 
 /// ReadinessBanner 展示模型。
@@ -126,7 +129,7 @@ enum Copywriting {
         switch (subdir as NSString).lastPathComponent {
         case "xwechat_files": return "微信聊天文件"
         case "app_data": return "微信应用数据"
-        case "com.tencent.xinWeChat": return "微信兼容数据"
+        case let name where WeChatInstance.isWeChatBundleID(name): return "微信兼容数据"
         default: return (subdir as NSString).lastPathComponent
         }
     }

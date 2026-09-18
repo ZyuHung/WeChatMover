@@ -51,6 +51,33 @@ enum ResignGuideReason {
 
 @MainActor
 final class AppViewModel: ObservableObject {
+    /// 本视图模型负责的微信实例（主微信或双开副本），各实例状态互相独立。
+    nonisolated let instance: WeChatInstance
+    /// 该实例在目标文件夹下的数据目录名（WeChatData / WeChatData2 …）。
+    nonisolated var dataFolder: String { instance.dataFolderName }
+    private var targetBaseKey: String { instance.defaultsKey(DefaultsKey.targetBasePath) }
+    private var lastSignedVersionKey: String { instance.defaultsKey(DefaultsKey.lastSignedVersion) }
+
+    init(instance: WeChatInstance = .primary) {
+        self.instance = instance
+        let bundleID = instance.bundleID
+        let appURL = instance.appURL
+        isWeChatRunning = { WeChatDetector.isRunning(bundleID: bundleID) }
+        resignRunner = { completion in
+            CodeSigner.resignWeChat(appPath: appURL.path, completion: completion)
+        }
+        isAppBundleWritable = { CodeSigner.isWritableByCurrentUser(appPath: appURL.path) }
+        signatureVerifier = { WeChatDetector.signatureStatus(appURL: appURL) }
+        wechatQuitter = { await WeChatQuitter.ensureQuit(bundleID: bundleID) }
+        dualInstanceQuitter = { await DualInstanceRepairer.ensureQuit(appURL: appURL) }
+        bundleIDWriter = { completion in
+            DualInstanceRepairer.setBundleIdentifier(bundleID, appPath: appURL.path,
+                                                     completion: completion)
+        }
+        launchServicesRegistrar = { DualInstanceRepairer.register(appPath: appURL.path) }
+        containerRoot = instance.containerRoot
+    }
+
     @Published var wechat = WeChatInfo()
     @Published var items: [ItemStatus] = []
     @Published var targetBase: URL? = nil
@@ -104,19 +131,23 @@ final class AppViewModel: ObservableObject {
     var showCleanExternalConfirm: Bool { activeDialog == .cleanExternal }
     var showAppManagementGuide: Bool { activeSheet == .appManagementGuide }
 
+    /// 以下依赖在 init 里按实例绑定（主微信 / 双开各自的 bundle ID 与 App 路径）。
     /// 运行状态探测（测试可注入假实现）。
-    var isWeChatRunning: () -> Bool = WeChatDetector.isRunning
+    var isWeChatRunning: () -> Bool
     /// 实际执行重签名的闭包（测试可注入假实现）。
-    var resignRunner: (@escaping @Sendable (CodeSigner.ResignResult) -> Void) -> Void =
-        CodeSigner.resignWeChat
-    /// /Applications/WeChat.app 可写性探测（测试可注入假实现）。
-    var isAppBundleWritable: () -> Bool = { CodeSigner.isWritableByCurrentUser() }
+    var resignRunner: (@escaping @Sendable (CodeSigner.ResignResult) -> Void) -> Void
+    /// 微信 App 包可写性探测（测试可注入假实现）。
+    var isAppBundleWritable: () -> Bool
     /// 签名状态检测（重签名后复核 / 手动检测共用；测试可注入假实现，避免扫真实 App）。
-    var signatureVerifier: @Sendable () -> WeChatDetector.SignatureStatus = {
-        WeChatDetector.signatureStatus()
-    }
+    var signatureVerifier: @Sendable () -> WeChatDetector.SignatureStatus
     /// 退出微信流程（测试可注入假实现，不触碰真实微信）。
-    var wechatQuitter: @Sendable () async -> Bool = { await WeChatQuitter.ensureQuit() }
+    var wechatQuitter: @Sendable () async -> Bool
+    /// 修复双开：按 App 路径退出副本（被还原的副本与主微信同 bundle ID，不能按 ID 退）。
+    var dualInstanceQuitter: @Sendable () async -> Bool
+    /// 修复双开：改回副本 Info.plist 的 bundle ID（测试可注入假实现）。
+    var bundleIDWriter: (@escaping @Sendable (CodeSigner.ResignResult) -> Void) -> Void
+    /// 修复双开：重新登记到 LaunchServices（测试可注入空实现）。
+    var launchServicesRegistrar: @Sendable () -> Void
     /// 偏好存储（测试注入独立 suite，避免并行测试共享 standard 的竞态）。
     var defaults: UserDefaults = .standard
 
@@ -127,7 +158,7 @@ final class AppViewModel: ObservableObject {
     }
 
     /// 容器根目录（测试可注入临时目录 fixture，默认真实路径）。
-    var containerRoot = WeChatPaths.defaultContainerRoot
+    var containerRoot: URL
 
     // MARK: - 派生状态
 
@@ -148,6 +179,22 @@ final class AppViewModel: ObservableObject {
         return "内置"
     }
 
+    /// 双开副本被微信自动升级还原：包里的 bundle ID 已不是该实例应有的值。
+    var needsDualInstanceRepair: Bool {
+        guard !instance.isPrimary, wechat.isInstalled, let actual = wechat.bundleIdentifier else {
+            return false
+        }
+        return actual != instance.bundleID
+    }
+
+    /// 指引弹窗里的终端兜底命令：需要修复双开时连同改 bundle ID 一起给出。
+    var manualFixCommand: String {
+        let path = instance.appURL.path
+        return needsDualInstanceRepair
+            ? DualInstanceRepairer.terminalCommand(bundleID: instance.bundleID, appPath: path)
+            : CodeSigner.terminalCommand(appPath: path)
+    }
+
     var isTargetAPFS: Bool {
         guard let fs = targetFSType else { return false }
         return DiskProbe.isAPFS(fsTypeName: fs)
@@ -156,7 +203,7 @@ final class AppViewModel: ObservableObject {
     /// 微信版本相对上次签名是否变化（提示需要重签名）。
     var wechatVersionChanged: Bool {
         guard let current = wechat.version else { return false }
-        guard let last = defaults.string(forKey: DefaultsKey.lastSignedVersion) else { return false }
+        guard let last = defaults.string(forKey: lastSignedVersionKey) else { return false }
         return current != last
     }
 
@@ -180,7 +227,7 @@ final class AppViewModel: ObservableObject {
 
     /// 外置数据根目录：<用户选择的目标文件夹>/WeChatData。
     var externalDataURL: URL? {
-        targetBase.map { WeChatPaths.targetRoot(forBase: $0) }
+        targetBase.map { WeChatPaths.targetRoot(forBase: $0, folder: dataFolder) }
     }
 
     /// 外置 WeChatData 是否存在（决定「清理外置数据」按钮显隐）。
@@ -257,6 +304,7 @@ final class AppViewModel: ObservableObject {
     var safetyIssues: [String] {
         var issues: [String] = []
         if !wechat.isInstalled { issues.append("未检测到微信") }
+        if needsDualInstanceRepair { issues.append("双开已被微信升级还原，需要修复双开") }
         if wechat.isAppStoreVersion { issues.append("App Store 版微信不受支持") }
         if !containerReadable { issues.append("需要完全磁盘访问权限") }
         if !interruptedItems.isEmpty { issues.append("存在迁移中断残留") }
@@ -287,6 +335,9 @@ final class AppViewModel: ObservableObject {
         }
         if isLoading { return .checking }
         guard wechat.isInstalled else { return .blocked(.notInstalled) }
+        guard !needsDualInstanceRepair else {
+            return .blocked(.dualInstanceReverted(name: instance.displayName))
+        }
         guard !wechat.isAppStoreVersion else { return .blocked(.appStoreVersion) }
         guard containerReadable else { return .blocked(.containerUnreadable) }
         guard interruptedItems.isEmpty else { return .blocked(.interruptedResidue) }
@@ -358,6 +409,12 @@ final class AppViewModel: ObservableObject {
                 title: "未检测到微信",
                 message: "请先安装微信官网下载版，再使用本工具迁移数据。",
                 fix: .openOfficialDownload)
+        case .dualInstanceReverted(let name):
+            return BannerModel(
+                tone: .warning, symbol: "exclamationmark.triangle.fill",
+                title: "\(name) 已被微信升级还原",
+                message: "微信自动升级把 \(name) 整包换回了官方版本（bundle ID 变回主微信的），现在打开它只会切到主微信。点「修复双开」自动改回并重新签名，无需输入密码；修复后直接从拓展坞打开即可。",
+                fix: .repairDualInstance)
         case .appStoreVersion:
             return BannerModel(
                 tone: .danger, symbol: "xmark.octagon.fill",
@@ -456,6 +513,11 @@ final class AppViewModel: ObservableObject {
                 tone: .info, symbol: "arrow.triangle.2.circlepath",
                 title: "正在退出微信…",
                 message: "优先优雅退出，几秒后未退出会强制结束。")
+        case .repairingDualInstance:
+            return BannerModel(
+                tone: .info, symbol: "arrow.triangle.2.circlepath",
+                title: "正在修复双开…",
+                message: "改回独立的 bundle ID，随后重新签名；如副本正在运行会先退出它。")
         case .resigning:
             return BannerModel(
                 tone: .info, symbol: "arrow.triangle.2.circlepath",
@@ -554,14 +616,17 @@ final class AppViewModel: ObservableObject {
         isLoading = true
         sizesLoaded = false
         let containerRoot = self.containerRoot
-        let savedTarget = defaults.string(forKey: DefaultsKey.targetBasePath)
+        let candidateSubdirs = instance.candidateSubdirs
+        let dataFolder = self.dataFolder
+        let savedTarget = defaults.string(forKey: targetBaseKey)
         if let savedTarget {
             targetBase = URL(fileURLWithPath: savedTarget)
         }
 
         // 1) 微信本体检测：只读 /Applications/WeChat.app 的 Info.plist，毫秒级。
+        let instance = self.instance
         Task.detached { [weak self] in
-            let info = WeChatDetector.detect()
+            let info = WeChatDetector.detect(appURL: instance.appURL, bundleID: instance.bundleID)
             await self?.applyWeChat(info)
         }
 
@@ -581,7 +646,7 @@ final class AppViewModel: ObservableObject {
         //    随后才做可能分钟级的目录大小枚举。
         Task.detached { [weak self] in
             let readable = PermissionHelper.canReadContainer(path: containerRoot.path)
-            let items: [ItemStatus] = WeChatPaths.candidateSubdirs.compactMap { subdir in
+            let items: [ItemStatus] = candidateSubdirs.compactMap { subdir in
                 let source = WeChatPaths.sourceDirectory(containerRoot: containerRoot, subdir: subdir)
                 let state = itemState(at: source)
                 guard state != .missing else { return nil }
@@ -613,7 +678,7 @@ final class AppViewModel: ObservableObject {
             // 外置 WeChatData 占用（状态面板展示；可能分钟级，放最后）。
             var extSize: Int64? = nil
             if let savedTarget {
-                let root = WeChatPaths.targetRoot(forBase: URL(fileURLWithPath: savedTarget))
+                let root = WeChatPaths.targetRoot(forBase: URL(fileURLWithPath: savedTarget), folder: dataFolder)
                 if FileManager.default.fileExists(atPath: root.path) {
                     extSize = DiskProbe.directorySize(at: root)
                 }
@@ -745,7 +810,7 @@ final class AppViewModel: ObservableObject {
     /// 选中目标文件夹后的处理（与弹窗解耦，可单测）。
     func applyTargetSelection(_ url: URL) {
         targetBase = url
-        defaults.set(url.path, forKey: DefaultsKey.targetBasePath)
+        defaults.set(url.path, forKey: targetBaseKey)
         migrationOutcome = nil
         refreshTargetInfo()
         log("已选择目标位置：\(url.path)")
@@ -819,7 +884,7 @@ final class AppViewModel: ObservableObject {
         }
         var present = 0, missing = 0
         for item in migratedItems {
-            let t = WeChatPaths.targetDirectory(base: url, subdir: item.subdir)
+            let t = WeChatPaths.targetDirectory(base: url, subdir: item.subdir, folder: dataFolder)
             if FileManager.default.fileExists(atPath: t.path) { present += 1 } else { missing += 1 }
         }
         pendingRelocateBase = url
@@ -839,7 +904,7 @@ final class AppViewModel: ObservableObject {
         guard let newBase = pendingRelocateBase else { return }
         clearPendingRepoint()
         targetBase = newBase
-        defaults.set(newBase.path, forKey: DefaultsKey.targetBasePath)
+        defaults.set(newBase.path, forKey: targetBaseKey)
         refreshTargetInfo()
         log("已更新记录的目标位置：\(newBase.path)（未改动任何数据与链接）")
         log("⚠️ 提示：当前软链仍指向原位置。如新位置与实际数据位置不符，微信将无法正常读取。")
@@ -849,6 +914,7 @@ final class AppViewModel: ObservableObject {
     /// 执行改指：新位置已有数据的项换软链指向；缺数据的项跳过（保持原指向）。
     /// 全部改指成功才更新记录的目标位置；有跳过/失败则维持原记录，可补齐数据后重试（幂等）。
     func startRepoint() {
+        let dataFolder = self.dataFolder
         guard let newBase = pendingRelocateBase, targetBase != nil else { return }
         clearPendingRepoint(keepBase: false)
         wechat.isRunning = isWeChatRunning()
@@ -868,7 +934,7 @@ final class AppViewModel: ObservableObject {
             var skipped: [String] = []
             var failed: String? = nil
             for item in todo {
-                let newTarget = WeChatPaths.targetDirectory(base: newBase, subdir: item.subdir)
+                let newTarget = WeChatPaths.targetDirectory(base: newBase, subdir: item.subdir, folder: dataFolder)
                 guard FileManager.default.fileExists(atPath: newTarget.path) else {
                     skipped.append(item.displayName)
                     await self?.log("⏭ 新位置未找到 \(item.displayName)，保持原指向")
@@ -948,6 +1014,7 @@ final class AppViewModel: ObservableObject {
 
     /// 执行转移：逐项 拷贝→校验→软链换指向→删旧数据；全部完成后新位置生效。
     func startRelocation() {
+        let dataFolder = self.dataFolder
         guard let newBase = pendingRelocateBase, let oldBase = targetBase else { return }
         pendingRelocateBase = nil
         pendingRelocateNonAPFS = nil
@@ -966,7 +1033,7 @@ final class AppViewModel: ObservableObject {
         log("开始转移 \(todo.count) 个目录（共 \(DiskProbe.formatBytes(total))）到 \(newBase.path) …")
 
         // 轮询新位置已拷入的大小作为进度
-        let newRoot = WeChatPaths.targetRoot(forBase: newBase)
+        let newRoot = WeChatPaths.targetRoot(forBase: newBase, folder: dataFolder)
         let poller = Task.detached { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 500_000_000)
@@ -980,13 +1047,13 @@ final class AppViewModel: ObservableObject {
             var failed: String? = nil
             do {
                 for item in todo {
-                    let newTarget = WeChatPaths.targetDirectory(base: newBase, subdir: item.subdir)
+                    let newTarget = WeChatPaths.targetDirectory(base: newBase, subdir: item.subdir, folder: dataFolder)
                     try Migrator.relocateItem(source: item.source, newTarget: newTarget)
                     await self?.log("✅ 已转移：\(item.displayName)")
                 }
                 // manifest 跟随数据移动（指纹不变，无需重算）
                 let fm = FileManager.default
-                let oldRoot = WeChatPaths.targetRoot(forBase: oldBase)
+                let oldRoot = WeChatPaths.targetRoot(forBase: oldBase, folder: dataFolder)
                 let oldManifest = oldRoot.appendingPathComponent("manifest.json")
                 if fm.fileExists(atPath: oldManifest.path) {
                     try? fm.moveItem(at: oldManifest,
@@ -1007,7 +1074,7 @@ final class AppViewModel: ObservableObject {
         if let error {
             // 转移是逐项"先复制、校验后删旧"的：失败时逐项盘点实际位置，
             // 给用户准确的安抚信息（数据完整）与下一步（可重试续传）。
-            let newRoot = WeChatPaths.targetRoot(forBase: newBase).path
+            let newRoot = WeChatPaths.targetRoot(forBase: newBase, folder: dataFolder).path
             let movedCount = items.filter { item in
                 guard let dest = try? FileManager.default
                     .destinationOfSymbolicLink(atPath: item.source.path) else { return false }
@@ -1049,6 +1116,7 @@ final class AppViewModel: ObservableObject {
 
     /// 「还原外置存储数据到 Mac…」入口：有本地备份时先做新旧判定，再决定弹哪个确认框。
     func requestRestore() {
+        let dataFolder = self.dataFolder
         guard canRestore else { return }
         restoreNote = nil
         pendingRestoreForceExternal = false
@@ -1062,7 +1130,7 @@ final class AppViewModel: ObservableObject {
         busyKind = .comparing
         log("正在比对数据新旧…")
         Task.detached { [weak self] in
-            let same = Self.externalMatchesBackup(items: withBackup, base: base)
+            let same = Self.externalMatchesBackup(items: withBackup, base: base, dataFolder: dataFolder)
             await self?.restoreComparisonFinished(same: same)
         }
     }
@@ -1070,10 +1138,11 @@ final class AppViewModel: ObservableObject {
     /// 新旧判定：本地备份与外置数据是否一致。
     /// 有 manifest 只重算外置侧（快）；无 manifest（旧迁移）双侧各算一次。
     /// 返回 nil = 无法判定（外置不可读等），调用方回退现有流程。
-    nonisolated static func externalMatchesBackup(items: [ItemStatus], base: URL) -> Bool? {
-        let manifest = Fingerprint.readManifest(base: base)
+    nonisolated static func externalMatchesBackup(items: [ItemStatus], base: URL,
+                                               dataFolder: String = WeChatPaths.defaultDataFolder) -> Bool? {
+        let manifest = Fingerprint.readManifest(base: base, folder: dataFolder)
         for item in items {
-            let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir)
+            let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir, folder: dataFolder)
             guard let external = Fingerprint.compute(at: target) else { return nil }
             let reference: Fingerprint.Value
             if let fromManifest = manifest?.fingerprint(for: item.subdir) {
@@ -1128,6 +1197,7 @@ final class AppViewModel: ObservableObject {
     /// 「还原内置存储数据到 Mac…」入口：外置可达时先做新旧判定。
     /// 外置更新 → 提示改用外置；一致或无法比对（拔盘）→ 直接走内置备份确认框。
     func requestRestoreBackups() {
+        let dataFolder = self.dataFolder
         guard canRestoreBackups else { return }
         let todo = restorableBackupItems
         guard let base = targetBase, !todo.isEmpty, hasExternalData else {
@@ -1140,7 +1210,7 @@ final class AppViewModel: ObservableObject {
         busyKind = .comparing
         log("正在比对数据新旧…")
         Task.detached { [weak self] in
-            let same = Self.externalMatchesBackup(items: todo, base: base)
+            let same = Self.externalMatchesBackup(items: todo, base: base, dataFolder: dataFolder)
             await self?.backupComparisonFinished(same: same)
         }
     }
@@ -1196,6 +1266,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func startMigration() {
+        let dataFolder = self.dataFolder
         guard let base = targetBase else { return }
         // 兜底：确认框打开期间微信又被启动，拒绝迁移。
         wechat.isRunning = isWeChatRunning()
@@ -1218,7 +1289,7 @@ final class AppViewModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 guard let self, await self.isBusy else { return }
                 let done = todo.reduce(Int64(0)) { sum, item in
-                    let t = WeChatPaths.targetDirectory(base: base, subdir: item.subdir)
+                    let t = WeChatPaths.targetDirectory(base: base, subdir: item.subdir, folder: dataFolder)
                     if FileManager.default.fileExists(atPath: t.path) {
                         return sum + min(DiskProbe.directorySize(at: t), item.size)
                     }
@@ -1234,7 +1305,7 @@ final class AppViewModel: ObservableObject {
             do {
                 try Migrator.checkSpace(totalBytes: total, targetPath: base.path)
                 for item in todo {
-                    let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir)
+                    let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir, folder: dataFolder)
                     try Migrator.migrateItem(source: item.source, target: target)
                     // 迁移时刻的指纹快照（stat 遍历，供还原时新旧判定）
                     if let fp = Fingerprint.compute(at: target) {
@@ -1253,7 +1324,7 @@ final class AppViewModel: ObservableObject {
                     try Fingerprint.writeManifest(
                         MigrationManifest(toolVersion: version, migratedAt: Date(),
                                           items: manifestItems),
-                        base: base)
+                        base: base, folder: dataFolder)
                     await self?.log("已写入迁移清单（manifest.json）")
                 } catch {
                     await self?.log("⚠️ 写入迁移清单失败（不影响迁移）：\(error.localizedDescription)")
@@ -1277,7 +1348,7 @@ final class AppViewModel: ObservableObject {
                 if let base = targetBase {
                     var all = [path]
                     for item in localItems {
-                        let t = WeChatPaths.targetDirectory(base: base, subdir: item.subdir).path
+                        let t = WeChatPaths.targetDirectory(base: base, subdir: item.subdir, folder: dataFolder).path
                         guard t != path, !all.contains(t) else { continue }
                         let isSymlink = (try? FileManager.default
                             .destinationOfSymbolicLink(atPath: item.source.path)) != nil
@@ -1305,15 +1376,17 @@ final class AppViewModel: ObservableObject {
     }
 
     /// 冲突路径必须形如 <base>/WeChatData/<子目录> 才允许删除，防误删（纯逻辑，可单测）。
-    nonisolated static func isConflictPathInsideTarget(_ path: String, base: URL) -> Bool {
-        path.hasPrefix(base.path + "/WeChatData/")
+    nonisolated static func isConflictPathInsideTarget(
+        _ path: String, base: URL, dataFolder: String = WeChatPaths.defaultDataFolder
+    ) -> Bool {
+        path.hasPrefix(base.path + "/\(dataFolder)/")
     }
 
     /// 确认框「删除旧数据并重新迁移」：删掉全部冲突目标后重跑迁移。
     func removeConflictingTargetAndMigrate() {
         guard !conflictingTargetPaths.isEmpty, let base = targetBase else { return }
         for path in conflictingTargetPaths {
-            guard Self.isConflictPathInsideTarget(path, base: base) else {
+            guard Self.isConflictPathInsideTarget(path, base: base, dataFolder: dataFolder) else {
                 conflictingTargetPaths = []
                 lastError = "路径不在所选目标目录内，已拒绝删除：\(path)"
                 log("❌ 拒绝删除目标目录外的路径：\(path)")
@@ -1348,9 +1421,10 @@ final class AppViewModel: ObservableObject {
     /// 确认框「直接使用外置数据」：冲突项不拷贝——本地改名 _backup 并建软链指向外置已有数据；
     /// 其余待迁移项继续正常迁移。
     func adoptExistingTargetsAndMigrate() {
+        let dataFolder = self.dataFolder
         guard !conflictingTargetPaths.isEmpty, let base = targetBase else { return }
         for path in conflictingTargetPaths {
-            guard Self.isConflictPathInsideTarget(path, base: base) else {
+            guard Self.isConflictPathInsideTarget(path, base: base, dataFolder: dataFolder) else {
                 conflictingTargetPaths = []
                 lastError = "路径不在所选目标目录内，已拒绝使用：\(path)"
                 log("❌ 拒绝使用目标目录外的路径：\(path)")
@@ -1359,7 +1433,7 @@ final class AppViewModel: ObservableObject {
         }
         let paths = Set(conflictingTargetPaths)
         let adopted = localItems.filter {
-            paths.contains(WeChatPaths.targetDirectory(base: base, subdir: $0.subdir).path)
+            paths.contains(WeChatPaths.targetDirectory(base: base, subdir: $0.subdir, folder: dataFolder).path)
         }
         let adoptedBytes = adopted.reduce(Int64(0)) { $0 + $1.size }
         conflictingTargetPaths = []
@@ -1372,7 +1446,7 @@ final class AppViewModel: ObservableObject {
             var failed: String? = nil
             do {
                 for item in adopted {
-                    let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir)
+                    let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir, folder: dataFolder)
                     try Migrator.adoptExternalItem(source: item.source, target: target)
                     await self?.log("✅ 已链接外置数据：\(item.displayName)")
                 }
@@ -1417,6 +1491,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func startRestore() {
+        let dataFolder = self.dataFolder
         guard let base = targetBase else { return }
         // 兜底：确认框打开期间微信又被启动，拒绝还原。
         wechat.isRunning = isWeChatRunning()
@@ -1435,7 +1510,7 @@ final class AppViewModel: ObservableObject {
             var failed: String? = nil
             do {
                 for item in todo {
-                    let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir)
+                    let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir, folder: dataFolder)
                     try Migrator.restoreItem(source: item.source, target: target)
                     await self?.log("✅ 已还原：\(item.displayName)")
                 }
@@ -1463,6 +1538,7 @@ final class AppViewModel: ObservableObject {
     /// 强制从外置盘还原（新旧判定不一致、用户选「使用外置数据还原」）：
     /// 忽略本地备份，逐项从外置拷回，过期 _backup 随各项一并清除。
     func startRestoreFromExternal() {
+        let dataFolder = self.dataFolder
         guard let base = targetBase else { return }
         // 兜底：确认框打开期间微信又被启动，拒绝还原。
         wechat.isRunning = isWeChatRunning()
@@ -1480,7 +1556,7 @@ final class AppViewModel: ObservableObject {
             var failed: String? = nil
             do {
                 for item in todo {
-                    let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir)
+                    let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir, folder: dataFolder)
                     try Migrator.restoreItemFromExternal(source: item.source, target: target)
                     await self?.log("✅ 已从外置还原：\(item.displayName)")
                 }
@@ -1539,21 +1615,23 @@ final class AppViewModel: ObservableObject {
 
     /// 「用外置数据覆盖内置…」入口：先双侧比对（外置目录 vs 当前内置源目录）。
     func requestOverwriteWithExternal() {
+        let dataFolder = self.dataFolder
         guard canOverwriteLocalWithExternal, let base = targetBase else { return }
         let todo = localItems
         isBusy = true
         busyKind = .comparing
         log("正在比对数据新旧…")
         Task.detached { [weak self] in
-            let same = Self.externalMatchesLocal(items: todo, base: base)
+            let same = Self.externalMatchesLocal(items: todo, base: base, dataFolder: dataFolder)
             await self?.overwriteComparisonFinished(same: same)
         }
     }
 
     /// 比对各迁移项：外置目录 vs 内置源目录。nil = 有一侧不可读。
-    nonisolated static func externalMatchesLocal(items: [ItemStatus], base: URL) -> Bool? {
+    nonisolated static func externalMatchesLocal(items: [ItemStatus], base: URL,
+                                              dataFolder: String = WeChatPaths.defaultDataFolder) -> Bool? {
         for item in items {
-            let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir)
+            let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir, folder: dataFolder)
             guard let external = Fingerprint.compute(at: target) else { return nil }
             guard let local = Fingerprint.compute(at: item.source) else { return nil }
             if external != local { return false }
@@ -1582,6 +1660,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func startOverwriteWithExternal() {
+        let dataFolder = self.dataFolder
         guard let base = targetBase else { return }
         // 兜底：确认框打开期间微信又被启动，拒绝覆盖。
         wechat.isRunning = isWeChatRunning()
@@ -1600,7 +1679,7 @@ final class AppViewModel: ObservableObject {
             var failed: String? = nil
             do {
                 for item in todo {
-                    let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir)
+                    let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir, folder: dataFolder)
                     try Migrator.overwriteLocalWithExternal(source: item.source, target: target)
                     await self?.log("✅ 已覆盖：\(item.displayName)（原内置数据已保留为 _backup）")
                 }
@@ -1632,7 +1711,7 @@ final class AppViewModel: ObservableObject {
         guard isAppBundleWritable() else {
             resignGuideReason = .notWritable
             activeSheet = .appManagementGuide
-            log("⚠️ \(CodeSigner.wechatAppPath) 当前用户不可写，请按指引在终端执行 sudo 命令")
+            log("⚠️ \(instance.appURL.path) 当前用户不可写，请按指引在终端执行 sudo 命令")
             return
         }
         isResigning = true
@@ -1648,8 +1727,12 @@ final class AppViewModel: ObservableObject {
         isResigning = false
         switch result {
         case .success:
+            if pendingRepairNotice {
+                pendingRepairNotice = false
+                notice = "双开已修复：\(instance.displayName) 已改回 \(instance.bundleID) 并重新签名，现在可以直接从拓展坞或「应用程序」打开。"
+            }
             if let v = wechat.version {
-                defaults.set(v, forKey: DefaultsKey.lastSignedVersion)
+                defaults.set(v, forKey: lastSignedVersionKey)
             }
             log("✅ 微信重签名完成，正在复核签名…")
             refresh()
@@ -1660,12 +1743,14 @@ final class AppViewModel: ObservableObject {
                 await self?.resignVerified(status)
             }
         case .appManagementDenied(let detail):
+            pendingRepairNotice = false
             // TCC「App 管理」权限缺失：弹授权指引（含终端兜底命令）。
             resignGuideReason = .appManagementDenied
             log("⚠️ 重签名被系统拒绝：缺少「App 管理」权限（\(detail)）")
             activeSheet = .appManagementGuide
             refresh()
         case .failed(let message):
+            pendingRepairNotice = false
             log("⚠️ 重签名未完成：\(message)")
             refresh()
         }
@@ -1680,6 +1765,86 @@ final class AppViewModel: ObservableObject {
             log("⚠️ 复核：签名校验通过但仍是官方签名，请重试重签名")
         case .broken:
             log("⚠️ 重签名后复核仍未通过，请重试；或按指引在终端执行兜底命令")
+        }
+    }
+
+    // MARK: - 修复双开
+
+    /// 修复双开完成重签名后弹成功提示。
+    private var pendingRepairNotice = false
+
+    /// 「修复双开」：退出副本（如在运行）→ 改回 bundle ID → 重新登记 → 重签名并复核。
+    /// 幂等：bundle ID 本来就对时等同于重签名。
+    func repairDualInstance() {
+        guard !instance.isPrimary, !isBusy, !isResigning, !isQuittingWeChat else { return }
+        activateApp()
+        guard isAppBundleWritable() else {
+            resignGuideReason = .notWritable
+            activeSheet = .appManagementGuide
+            log("⚠️ \(instance.appURL.path) 当前用户不可写，请按指引在终端执行命令")
+            return
+        }
+        isBusy = true
+        busyKind = .repairingDualInstance
+        migrationOutcome = nil
+        log("正在修复双开：\(instance.appURL.lastPathComponent) → \(instance.bundleID) …")
+        let quitter = dualInstanceQuitter
+        Task.detached { [weak self] in
+            let quit = await quitter()
+            await self?.repairAfterQuit(quit)
+        }
+    }
+
+    private func repairAfterQuit(_ quit: Bool) {
+        guard quit else {
+            isBusy = false
+            busyKind = nil
+            lastError = "无法退出 \(instance.displayName)，请手动退出后再点「修复双开」。"
+            log("❌ 修复双开中止：\(instance.displayName) 未能退出")
+            return
+        }
+        bundleIDWriter { [weak self] result in
+            Task { @MainActor [weak self] in self?.bundleIDWritten(result) }
+        }
+    }
+
+    private func bundleIDWritten(_ result: CodeSigner.ResignResult) {
+        switch result {
+        case .success:
+            log("✅ 已改回 bundle ID：\(instance.bundleID)")
+            let registrar = launchServicesRegistrar
+            Task.detached { [weak self] in
+                registrar()
+                await self?.repairRegistered()
+            }
+        case .appManagementDenied(let detail):
+            isBusy = false
+            busyKind = nil
+            resignGuideReason = .appManagementDenied
+            activeSheet = .appManagementGuide
+            log("⚠️ 修复双开被系统拒绝：缺少「App 管理」权限（\(detail)）")
+        case .failed(let message):
+            isBusy = false
+            busyKind = nil
+            lastError = "修复双开失败：\(message)"
+            log("❌ 修复双开失败：\(message)")
+        }
+    }
+
+    private func repairRegistered() {
+        isBusy = false
+        busyKind = nil
+        wechat.bundleIdentifier = instance.bundleID
+        pendingRepairNotice = true
+        resignWeChat()
+    }
+
+    /// 轻量复检微信本体（只读 Info.plist，毫秒级）：窗口重新激活时发现副本被升级还原。
+    func refreshWeChatInfo() {
+        let instance = self.instance
+        Task.detached { [weak self] in
+            let info = WeChatDetector.detect(appURL: instance.appURL, bundleID: instance.bundleID)
+            await self?.applyWeChat(info)
         }
     }
 
@@ -1740,8 +1905,10 @@ final class AppViewModel: ObservableObject {
     }
 
     /// 删除前确认路径形如 <目标文件夹>/WeChatData，防误删（纯逻辑，可单测）。
-    nonisolated static func isExternalDataPathValid(_ path: String, base: URL) -> Bool {
-        path == WeChatPaths.targetRoot(forBase: base).path
+    nonisolated static func isExternalDataPathValid(
+        _ path: String, base: URL, dataFolder: String = WeChatPaths.defaultDataFolder
+    ) -> Bool {
+        path == WeChatPaths.targetRoot(forBase: base, folder: dataFolder).path
     }
 
     /// 「清理外置数据…」按钮：安全校验 → 后台统计大小 → 弹二次确认框。
@@ -1754,7 +1921,7 @@ final class AppViewModel: ObservableObject {
             return
         }
         // 安全校验 2：路径形态必须是 <目标文件夹>/WeChatData
-        guard Self.isExternalDataPathValid(root.path, base: base) else {
+        guard Self.isExternalDataPathValid(root.path, base: base, dataFolder: dataFolder) else {
             lastError = "路径校验失败，已拒绝删除：\(root.path)"
             log("❌ 清理被拒绝：路径形态异常 \(root.path)")
             return
@@ -1778,7 +1945,7 @@ final class AppViewModel: ObservableObject {
     /// 二次确认「删除」后执行。
     func cleanExternalData() {
         guard let base = targetBase, let root = externalDataURL,
-              Self.isExternalDataPathValid(root.path, base: base) else { return }
+              Self.isExternalDataPathValid(root.path, base: base, dataFolder: dataFolder) else { return }
         // 确认框打开期间状态可能变化，再查一次使用中
         guard !Self.isExternalDataInUse(items: items, dataRoot: root) else {
             notice = "外置数据仍在使用中（存在指向它的符号链接）。如不再需要，请先「一键还原」再清理。"

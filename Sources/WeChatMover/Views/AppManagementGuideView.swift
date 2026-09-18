@@ -17,7 +17,7 @@ struct AppManagementGuideView: View {
                 .font(.headline)
 
             if vm.resignGuideReason == .notWritable {
-                Text("/Applications/WeChat.app 的所有者不是当前用户，WeChatMover 无法直接重签名。请在「终端」App 里执行以下命令：")
+                Text("\(vm.instance.appURL.path) 的所有者不是当前用户，WeChatMover 无法直接重签名。请在「终端」App 里执行以下命令：")
                     .font(.callout)
                 commandBlock
             } else {
@@ -45,9 +45,9 @@ struct AppManagementGuideView: View {
                 Button("以后再说") { dismiss() }
                 Spacer()
                 if vm.resignGuideReason != .notWritable {
-                    Button("重试重签名") {
+                    Button(vm.needsDualInstanceRepair ? "重试修复双开" : "重试重签名") {
                         dismiss()
-                        vm.resignWeChat()
+                        if vm.needsDualInstanceRepair { vm.repairDualInstance() } else { vm.resignWeChat() }
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(vm.isResigning)
@@ -60,7 +60,7 @@ struct AppManagementGuideView: View {
 
     private var commandBlock: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(CodeSigner.terminalCommand)
+            Text(vm.manualFixCommand)
                 .font(.system(.caption, design: .monospaced))
                 .textSelection(.enabled)
                 .padding(8)
@@ -68,7 +68,7 @@ struct AppManagementGuideView: View {
                 .background(Color.gray.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
             Button(copied ? "已复制 ✅" : "复制命令") {
                 NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(CodeSigner.terminalCommand, forType: .string)
+                NSPasteboard.general.setString(vm.manualFixCommand, forType: .string)
                 copied = true
             }
         }

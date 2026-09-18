@@ -2220,3 +2220,249 @@ private func makeOverwriteFixture(
                                    size: 0, hasBackup: false, backupSize: 0)]
     #expect(!vmMigrated.canOverwriteLocalWithExternal)
 }
+
+// MARK: - 双开实例（WeChat2.app / com.tencent.xinWeChat2）
+
+@Test func weChatBundleIDMatching() {
+    #expect(WeChatInstance.isWeChatBundleID("com.tencent.xinWeChat"))
+    #expect(WeChatInstance.isWeChatBundleID("com.tencent.xinWeChat2"))
+    #expect(!WeChatInstance.isWeChatBundleID("com.tencent.xinWeChat.WeChatMacShare"))
+    #expect(!WeChatInstance.isWeChatBundleID("com.tencent.xinWeChat.WeChatFileProviderExtension"))
+    #expect(!WeChatInstance.isWeChatBundleID("com.tencent.qq"))
+}
+
+@Test func secondaryInstancePaths() {
+    let second = WeChatInstance(bundleID: "com.tencent.xinWeChat2",
+                                appURL: URL(fileURLWithPath: "/Applications/WeChat2.app"))
+    #expect(!second.isPrimary)
+    #expect(second.suffix == "2")
+    #expect(second.dataFolderName == "WeChatData2")
+    #expect(second.displayName == "WeChat2")
+    #expect(second.containerRoot.path.hasSuffix("Library/Containers/com.tencent.xinWeChat2/Data"))
+    #expect(second.candidateSubdirs.contains("Library/Application Support/com.tencent.xinWeChat2"))
+    #expect(second.defaultsKey(DefaultsKey.targetBasePath) == "targetBasePath.com.tencent.xinWeChat2")
+
+    // 主微信保持原有路径与偏好键（兼容已迁移用户）
+    let primary = WeChatInstance.primary
+    #expect(primary.dataFolderName == "WeChatData")
+    #expect(primary.containerRoot == WeChatPaths.defaultContainerRoot)
+    #expect(primary.candidateSubdirs == WeChatPaths.candidateSubdirs)
+    #expect(primary.defaultsKey(DefaultsKey.targetBasePath) == DefaultsKey.targetBasePath)
+
+    // 同一目标文件夹下两个实例的数据目录互不冲突
+    let base = URL(fileURLWithPath: "/Volumes/Ext")
+    #expect(WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files",
+                                        folder: second.dataFolderName).path
+            == "/Volumes/Ext/WeChatData2/xwechat_files")
+    #expect(Copywriting.itemName("Library/Application Support/com.tencent.xinWeChat2") == "微信兼容数据")
+}
+
+@Test func discoverInstances() throws {
+    try withTempDir { root in
+        func makeApp(_ name: String, bundleID: String) throws {
+            let contents = root.appendingPathComponent("\(name).app/Contents", isDirectory: true)
+            try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+            let plist: NSDictionary = ["CFBundleIdentifier": bundleID]
+            #expect(plist.write(to: contents.appendingPathComponent("Info.plist"), atomically: true))
+        }
+        try makeApp("WeChat2", bundleID: "com.tencent.xinWeChat2")
+        try makeApp("WeChat", bundleID: "com.tencent.xinWeChat")
+        try makeApp("WeChat3", bundleID: "com.tencent.xinWeChat3")
+        try makeApp("Share", bundleID: "com.tencent.xinWeChat.WeChatMacShare")
+        try makeApp("Other", bundleID: "com.example.other")
+
+        let found = WeChatInstance.discover(in: [root])
+        #expect(found.map(\.bundleID)
+                == ["com.tencent.xinWeChat", "com.tencent.xinWeChat2", "com.tencent.xinWeChat3"])
+        #expect(found[1].appURL.lastPathComponent == "WeChat2.app")
+
+        // 主微信未安装时仍保留在首位（界面据此提示未安装）
+        let empty = root.appendingPathComponent("empty", isDirectory: true)
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        #expect(WeChatInstance.discover(in: [empty]) == [.primary])
+    }
+}
+
+@Test func codesignCommandsForInstance() {
+    #expect(CodeSigner.codesignArguments(appPath: "/Applications/WeChat2.app")
+            == ["--sign", "-", "--force", "--deep", "/Applications/WeChat2.app"])
+    #expect(CodeSigner.terminalCommand(appPath: "/Applications/WeChat2.app")
+            == "sudo codesign --sign - --force --deep /Applications/WeChat2.app")
+    #expect(CodeSigner.shellCommand(appPath: "/Applications/WeChat 2.app")
+            == "codesign --sign - --force --deep '/Applications/WeChat 2.app'")
+}
+
+@Test func conflictAndCleanPathChecksUseInstanceFolder() {
+    let base = URL(fileURLWithPath: "/Volumes/Ext")
+    #expect(AppViewModel.isConflictPathInsideTarget(
+        "/Volumes/Ext/WeChatData2/xwechat_files", base: base, dataFolder: "WeChatData2"))
+    // 双开实例不能删主微信的数据目录，反之亦然
+    #expect(!AppViewModel.isConflictPathInsideTarget(
+        "/Volumes/Ext/WeChatData/xwechat_files", base: base, dataFolder: "WeChatData2"))
+    #expect(!AppViewModel.isConflictPathInsideTarget(
+        "/Volumes/Ext/WeChatData2/xwechat_files", base: base))
+    #expect(AppViewModel.isExternalDataPathValid("/Volumes/Ext/WeChatData2", base: base,
+                                                 dataFolder: "WeChatData2"))
+    #expect(!AppViewModel.isExternalDataPathValid("/Volumes/Ext/WeChatData", base: base,
+                                                  dataFolder: "WeChatData2"))
+}
+
+@MainActor @Test func secondaryInstanceMigratesIntoOwnFolder() async throws {
+    // 主微信已迁移到 <base>/WeChatData；双开实例选同一目标文件夹，应迁移到 <base>/WeChatData2，互不冲突
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let (defaults, cleanup) = makeIsolatedDefaults()
+    defer { cleanup() }
+
+    let base = root.appendingPathComponent("external", isDirectory: true)
+    _ = try makeDataDir(root: root, "external/WeChatData/xwechat_files", fileSizes: [64])
+    let source = try makeDataDir(root: root, "container2/Documents/xwechat_files", fileSizes: [128])
+
+    let second = WeChatInstance(bundleID: "com.tencent.xinWeChat2",
+                                appURL: root.appendingPathComponent("WeChat2.app"))
+    let vm = AppViewModel(instance: second)
+    vm.defaults = defaults
+    vm.isWeChatRunning = { false }
+    vm.resignRunner = { completion in completion(.success) }
+    vm.containerRoot = root.appendingPathComponent("container2", isDirectory: true)
+    vm.applyTargetSelection(base)
+    #expect(defaults.string(forKey: "targetBasePath.com.tencent.xinWeChat2") == base.path)
+    #expect(defaults.string(forKey: DefaultsKey.targetBasePath) == nil)   // 不覆盖主微信记录
+    vm.items = [ItemStatus(subdir: "Documents/xwechat_files", source: source,
+                           state: .local, size: 128, hasBackup: false, backupSize: 0)]
+
+    vm.startMigration()
+    #expect(await waitUntil { !vm.isBusy && itemState(at: source) == .migrated })
+    #expect(!vm.showExistingTargetConfirm)   // 主微信的 WeChatData 不算冲突
+    let target = base.appendingPathComponent("WeChatData2/xwechat_files")
+    #expect(try FileManager.default.destinationOfSymbolicLink(atPath: source.path) == target.path)
+    #expect(DiskProbe.directorySize(at: target) == 128)
+    #expect(DiskProbe.directorySize(at: base.appendingPathComponent("WeChatData/xwechat_files")) == 64)
+    #expect(FileManager.default.fileExists(
+        atPath: base.appendingPathComponent("WeChatData2/manifest.json").path))
+    #expect(vm.externalDataURL?.lastPathComponent == "WeChatData2")
+}
+
+// MARK: - 修复双开（副本被微信升级还原）
+
+private func makeFakeApp(in dir: URL, _ name: String, bundleID: String) throws -> URL {
+    let app = dir.appendingPathComponent("\(name).app", isDirectory: true)
+    let contents = app.appendingPathComponent("Contents", isDirectory: true)
+    try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+    let plist: NSDictionary = ["CFBundleIdentifier": bundleID, "CFBundleShortVersionString": "4.1.15"]
+    #expect(plist.write(to: contents.appendingPathComponent("Info.plist"), atomically: true))
+    return app
+}
+
+@Test func inferBundleIDFromAppName() {
+    #expect(WeChatInstance.inferredBundleID(forAppNamed: "WeChat2.app") == "com.tencent.xinWeChat2")
+    #expect(WeChatInstance.inferredBundleID(forAppNamed: "WeChatB.app") == "com.tencent.xinWeChatB")
+    #expect(WeChatInstance.inferredBundleID(forAppNamed: "WeChat.app") == nil)
+    #expect(WeChatInstance.inferredBundleID(forAppNamed: "WeChat 2.app") == nil)
+    #expect(WeChatInstance.inferredBundleID(forAppNamed: "微信小号.app") == nil)
+}
+
+@Test func discoverRevertedDualInstance() throws {
+    try withTempDir { root in
+        // 升级后两个包都自称主微信
+        let main = try makeFakeApp(in: root, "WeChat", bundleID: "com.tencent.xinWeChat")
+        let second = try makeFakeApp(in: root, "WeChat2", bundleID: "com.tencent.xinWeChat")
+        let custom = try makeFakeApp(in: root, "小号", bundleID: "com.tencent.xinWeChat")
+
+        // 文件名推断：WeChat2.app 归回 xinWeChat2；主微信仍是 WeChat.app；无法推断的名字跳过
+        let found = WeChatInstance.discover(in: [root])
+        #expect(found.map(\.bundleID) == ["com.tencent.xinWeChat", "com.tencent.xinWeChat2"])
+        #expect(found[0].appURL.path == main.path)
+        #expect(found[1].appURL.path == second.path)
+
+        // 记住的映射优先（自定义名字的副本也能归回）
+        let withKnown = WeChatInstance.discover(
+            in: [root], known: [custom.path: "com.tencent.xinWeChat3"])
+        #expect(withKnown.map(\.bundleID)
+                == ["com.tencent.xinWeChat", "com.tencent.xinWeChat2", "com.tencent.xinWeChat3"])
+    }
+}
+
+@Test func repairTerminalCommand() {
+    #expect(DualInstanceRepairer.terminalCommand(
+        bundleID: "com.tencent.xinWeChat2", appPath: "/Applications/WeChat2.app")
+        == "/usr/libexec/PlistBuddy -c \"Set :CFBundleIdentifier com.tencent.xinWeChat2\" "
+        + "/Applications/WeChat2.app/Contents/Info.plist"
+        + " && codesign --sign - --force --deep /Applications/WeChat2.app")
+}
+
+@Test func setBundleIdentifierRewritesPlist() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let app = try makeFakeApp(in: root, "WeChat2", bundleID: "com.tencent.xinWeChat")
+
+    let result: CodeSigner.ResignResult = await withCheckedContinuation { cont in
+        DualInstanceRepairer.setBundleIdentifier("com.tencent.xinWeChat2", appPath: app.path) {
+            cont.resume(returning: $0)
+        }
+    }
+    #expect(result == .success)
+    #expect(WeChatDetector.bundleIdentifier(appURL: app) == "com.tencent.xinWeChat2")
+    #expect(WeChatDetector.version(appURL: app) == "4.1.15")   // 其他键不受影响
+}
+
+@MainActor @Test func repairDualInstanceFlow() async throws {
+    let (defaults, cleanup) = makeIsolatedDefaults()
+    defer { cleanup() }
+    let second = WeChatInstance(bundleID: "com.tencent.xinWeChat2",
+                                appURL: URL(fileURLWithPath: "/nonexistent/WeChat2.app"))
+    let vm = AppViewModel(instance: second)
+    vm.defaults = defaults
+    vm.wechat = WeChatInfo(isInstalled: true, version: "4.1.15",
+                           bundleIdentifier: "com.tencent.xinWeChat")
+
+    // 被还原：阻塞迁移，横幅给出「修复双开」
+    #expect(vm.needsDualInstanceRepair)
+    #expect(vm.appStatus == .blocked(.dualInstanceReverted(name: "WeChat2")))
+    #expect(vm.banner.fix == .repairDualInstance)
+    #expect(vm.manualFixCommand.contains("Set :CFBundleIdentifier com.tencent.xinWeChat2"))
+
+    final class Calls: @unchecked Sendable { var quit = 0, write = 0, register = 0, resign = 0 }
+    let calls = Calls()
+    vm.isAppBundleWritable = { true }
+    vm.dualInstanceQuitter = { calls.quit += 1; return true }
+    vm.bundleIDWriter = { completion in calls.write += 1; completion(.success) }
+    vm.launchServicesRegistrar = { calls.register += 1 }
+    vm.resignRunner = { completion in calls.resign += 1; completion(.success) }
+    vm.signatureVerifier = { .adhoc }
+    vm.containerRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)")
+
+    vm.repairDualInstance()
+    #expect(await waitUntil { vm.notice != nil })
+    #expect(calls.quit == 1 && calls.write == 1 && calls.register == 1 && calls.resign == 1)
+    #expect(vm.notice?.contains("双开已修复") == true)
+    #expect(!vm.isBusy)
+    #expect(vm.lastError == nil)
+}
+
+@MainActor @Test func repairDualInstanceAppManagementDenied() async throws {
+    let second = WeChatInstance(bundleID: "com.tencent.xinWeChat2",
+                                appURL: URL(fileURLWithPath: "/nonexistent/WeChat2.app"))
+    let vm = AppViewModel(instance: second)
+    vm.wechat = WeChatInfo(isInstalled: true, bundleIdentifier: "com.tencent.xinWeChat")
+    vm.isAppBundleWritable = { true }
+    vm.dualInstanceQuitter = { true }
+    vm.bundleIDWriter = { $0(.appManagementDenied("Operation not permitted")) }
+    vm.resignRunner = { _ in Issue.record("未授权时不应继续重签名") }
+
+    vm.repairDualInstance()
+    #expect(await waitUntil { vm.showAppManagementGuide })
+    #expect(vm.resignGuideReason == .appManagementDenied)
+    #expect(!vm.isBusy)
+    #expect(vm.needsDualInstanceRepair)   // 仍待修复，指引里的重试按钮会重走修复
+
+    // 主微信实例不提供修复
+    let primary = AppViewModel()
+    primary.wechat = WeChatInfo(isInstalled: true, bundleIdentifier: "com.tencent.xinWeChat")
+    #expect(!primary.needsDualInstanceRepair)
+}

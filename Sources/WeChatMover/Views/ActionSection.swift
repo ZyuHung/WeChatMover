@@ -122,7 +122,7 @@ struct ManageSection: View {
                             .controlSize(.small)
                             .disabled(!vm.canCleanExternalData)
                             .help(vm.canCleanExternalData
-                                  ? "删除外置硬盘上的 WeChatData"
+                                  ? "删除外置硬盘上的 \(vm.dataFolder)"
                                   : "还原数据到 Mac 后可清理")
                     }
                 }

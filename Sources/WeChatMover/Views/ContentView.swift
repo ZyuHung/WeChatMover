@@ -245,7 +245,7 @@ struct ContentView: View {
             return Alert(
                 title: Text("还原外置存储数据到 Mac？"),
                 message: Text((vm.restoreNote.map { $0 + "\n\n" } ?? "")
-                    + "来源：外置硬盘上的 WeChatData → 目标：Mac 内置盘原位置。如微信正在运行，将先自动退出。"),
+                    + "来源：外置硬盘上的 \(vm.dataFolder) → 目标：Mac 内置盘原位置。如微信正在运行，将先自动退出。"),
                 primaryButton: .destructive(Text("确认还原")) { vm.confirmRestore() },
                 secondaryButton: .cancel())
         case .restoreSameChoice, .restoreNewerChoice:

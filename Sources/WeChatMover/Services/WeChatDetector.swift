@@ -4,6 +4,8 @@ import AppKit
 struct WeChatInfo {
     var isInstalled: Bool = false
     var version: String? = nil
+    /// App 包 Info.plist 里当前的 CFBundleIdentifier（双开副本被升级还原时与实例应有值不符）。
+    var bundleIdentifier: String? = nil
     var isAppStoreVersion: Bool = false
     var isRunning: Bool = false
     var signature: WeChatDetector.SignatureStatus? = nil
@@ -11,8 +13,8 @@ struct WeChatInfo {
 
 /// 微信本体探测：是否安装、版本、是否 App Store 版、是否运行中、签名状态。
 enum WeChatDetector {
-    static let defaultAppURL = URL(fileURLWithPath: "/Applications/WeChat.app")
-    static let bundleID = "com.tencent.xinWeChat"
+    static let defaultAppURL = WeChatInstance.primary.appURL
+    static let bundleID = WeChatInstance.primaryBundleID
     static let officialDownloadURL = URL(string: "https://weixin.qq.com/")!
 
     /// 是否为 App Store 版：存在 Contents/_MASReceipt/receipt 即视为 MAS 版。
@@ -28,25 +30,38 @@ enum WeChatDetector {
         return dict["CFBundleShortVersionString"] as? String
     }
 
+    static func bundleIdentifier(appURL: URL) -> String? {
+        let plist = appURL.appendingPathComponent("Contents/Info.plist")
+        return NSDictionary(contentsOf: plist)?["CFBundleIdentifier"] as? String
+    }
+
     /// 微信是否正在运行（NSRunningApplication 查询，毫秒级，任意线程可调）。
     static func isRunning() -> Bool {
+        isRunning(bundleID: bundleID)
+    }
+
+    /// 指定实例是否运行中（双开各自独立判断，互不影响）。
+    static func isRunning(bundleID: String) -> Bool {
         !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty
     }
 
-    static func detect(appURL: URL = WeChatDetector.defaultAppURL) -> WeChatInfo {
+    static func detect(appURL: URL = WeChatDetector.defaultAppURL,
+                       bundleID: String = WeChatDetector.bundleID) -> WeChatInfo {
         let installed = FileManager.default.fileExists(atPath: appURL.path)
         var info = WeChatInfo()
         info.isInstalled = installed
         if installed {
             info.version = version(appURL: appURL)
+            info.bundleIdentifier = bundleIdentifier(appURL: appURL)
             info.isAppStoreVersion = isAppStoreVersion(appURL: appURL)
         }
-        info.isRunning = isRunning()
+        info.isRunning = isRunning(bundleID: bundleID)
         return info
     }
 
     /// 只读校验签名是否有效（codesign --verify，不写）。
-    static func checkSignature(appURL: URL = WeChatDetector.defaultAppURL) -> Bool {        let process = Process()
+    static func checkSignature(appURL: URL = WeChatDetector.defaultAppURL) -> Bool {
+        let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
         process.arguments = ["--verify", "--deep", "--strict", appURL.path]
         process.standardOutput = FileHandle.nullDevice

@@ -55,6 +55,13 @@ struct StatusSummaryGrid: View {
                         .disabled(vm.isBusy || vm.isResigning)
                         .help("微信或 macOS 更新后微信无法打开时，点此重新签名修复")
                 }
+                if vm.wechat.isInstalled && !vm.instance.isPrimary {
+                    // 双开副本常驻入口：微信自动升级把副本还原成主微信后，一键改回并重签名
+                    Button("修复双开") { vm.repairDualInstance() }
+                        .controlSize(.small)
+                        .disabled(vm.isBusy || vm.isResigning)
+                        .help("微信升级后 \(vm.instance.displayName) 只会打开主微信时，点此改回 \(vm.instance.bundleID) 并重新签名")
+                }
             }
             detailRow("目标磁盘格式", vm.targetFSType ?? "未选择")
             detailRow("内置盘剩余", vm.homeFreeSpace.map(DiskProbe.formatBytes) ?? "—")
@@ -81,6 +88,7 @@ struct StatusSummaryGrid: View {
 
 /// 单张摘要卡片：左上标签、左下主值+副文案、右上图标（支持真实微信图标）。
 struct StatusCard: View {
+    @EnvironmentObject var vm: AppViewModel
     let model: StatusCardModel
 
     var body: some View {
@@ -110,7 +118,7 @@ struct StatusCard: View {
     private var icon: some View {
         if model.customIcon == .weChatApp {
             // 运行时取微信 App 真实图标，无需打包资源
-            Image(nsImage: NSWorkspace.shared.icon(forFile: CodeSigner.wechatAppPath))
+            Image(nsImage: NSWorkspace.shared.icon(forFile: vm.instance.appURL.path))
                 .resizable()
                 .frame(width: 24, height: 24)
         } else {

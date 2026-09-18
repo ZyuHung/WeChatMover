@@ -73,6 +73,9 @@ struct ReadinessBanner: View {
             }
         case .retryMigration:
             Button("重试") { vm.requestMigration() }
+        case .repairDualInstance:
+            Button("修复双开") { vm.repairDualInstance() }
+                .buttonStyle(.borderedProminent)
         }
     }
 }

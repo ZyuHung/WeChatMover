@@ -22,6 +22,20 @@
 
 迁移后数据实际位于 `<你选择的文件夹>/WeChatData/<子目录名>`，原位置是同名符号链接。
 
+### 双开微信
+
+支持「复制一份 WeChat.app 并改 bundle ID」方式的双开（如 `/Applications/WeChat2.app`，`CFBundleIdentifier` 为 `com.tencent.xinWeChat2`）。启动时扫描 `/Applications` 与 `~/Applications`，检测到多个实例时窗口顶部出现切换器，每个实例完全独立：
+
+| | 主微信 | 双开（例） |
+| --- | --- | --- |
+| 容器 | `~/Library/Containers/com.tencent.xinWeChat/Data` | `~/Library/Containers/com.tencent.xinWeChat2/Data` |
+| 外置目录 | `<目标文件夹>/WeChatData` | `<目标文件夹>/WeChatData2` |
+| 退出 / 重签名 | 只作用于 `WeChat.app` | 只作用于 `WeChat2.app` |
+
+两个实例可以选同一个目标文件夹，数据目录不会冲突；操作一个实例时另一个微信照常运行。
+
+**修复双开**：微信自动升级会整包替换副本，bundle ID 变回 `com.tencent.xinWeChat`、签名变回官方，副本从此只会唤起主微信。工具按「记住的 App 路径」或文件名（`WeChat2.app` → `com.tencent.xinWeChat2`）认出被还原的副本，横幅提示并提供「修复双开」：退出该副本（按 App 路径，不会误退主微信）→ PlistBuddy 改回 bundle ID → `lsregister -f` 重新登记 → ad-hoc 重签名并复核。与重签名一样进程内直接执行，依赖 WeChatMover 的「App 管理」权限，无需密码；副本的安全检查详情里也常驻「修复双开」按钮。切回 WeChatMover 窗口时会自动复检。
+
 迁移流程：后台拷贝 → 大小校验 → 源目录改名为 `<原名>_backup`（**不删除**）→ 建软链 → 确认软链可达。任何一步失败都会自动回滚，不会丢数据。迁移完成后用 `codesign --sign - --force --deep /Applications/WeChat.app` 重签名并自动 `codesign -v` 复核，因为数据位置变化会破坏原签名校验。
 
 重签名**不需要管理员密码/ root**：拖拽安装的微信，`/Applications/WeChat.app` 所有者就是当前用户，直接签即可。真正需要的是 macOS Ventura+ 的 **「App 管理」权限**（修改其他 App 的包需显式授权）——所以本工具在进程内直接执行 codesign，让该权限归责到 WeChatMover 自身，按提示授权一次即可；不能借 osascript 提权签，那样权限会归责到系统中间进程，授权了也永远写不进去。
@@ -134,6 +148,7 @@ Sources/WeChatMover/
 │   ├── Migrator.swift         # 迁移/还原核心（拷贝→校验→源改名 _backup→建软链，带回滚）
 │   ├── CodeSigner.swift       # codesign 直签（不提权）+ 结果分类/复核
 │   ├── WeChatQuitter.swift    # 退出微信（优雅退出 → 必要时强杀）
+│   ├── DualInstanceRepairer.swift # 修复双开（改回 bundle ID + 重新登记）
 │   └── PermissionHelper.swift # TCC 检测与系统设置深链
 └── Views/                     # SwiftUI 界面（简体中文），按 UI 设计规范拆分：
     ├── DesignTokens.swift         # 颜色/间距/圆角 tokens（深浅色自适应，微信绿 accent）
